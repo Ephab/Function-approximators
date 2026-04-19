@@ -8,7 +8,6 @@ import PIL.Image as Image
 import sympy as sp
 import matplotlib.pyplot as plt
 
-# ------Parsing------ #
 parser = argparse.ArgumentParser(description='Train a neural network to approximate a function.')
 parser.add_argument('--epochs', type=int, default=100, help='The number of epochs to train the neural network.')
 parser.add_argument('--batch_size', type=int, default=64, help='The batch size to use when training the neural network.')
@@ -24,17 +23,14 @@ if args.function is None and args.image_path is None:
 
 if args.function is not None and args.image_path is not None:
     raise ValueError('You cannot specify both a function to approximate and an image to approximate.')    
-# ------------------ #
 
 
-# ------Config------ #
-
-#default (normal y = f(x) is 1 input and 1 output):
 input_size = 1
 output_size = 1
 is_image=False
 image = None
 function = None
+device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
 if args.image_path is not None:
     is_image = True
@@ -46,10 +42,8 @@ if args.image_path is not None:
         output_size = 1
 else:
     is_image = False  
-# ----------------- #
-    
-    
-# ----------------- #
+
+
 def createDataset(data, is_image):
     if is_image == False:
         func = data
@@ -81,108 +75,109 @@ if not is_image:
     parsed_function = sp.sympify(function)
     parsed_function = sp.lambdify(x, parsed_function, 'torch')
     dataset = createDataset(parsed_function, is_image=False)
-# ----------------- #
     
     
 loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-model = FunctionApproximator(input_size, output_size)
 
-class LitModel(L.LightningModule):
-    def __init__(self, model, learning_rate):
-        super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
 
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        output = self.model(x)
-        loss = torch.nn.functional.mse_loss(output, y)
-        self.log('train_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
+# Training loop:
+def train(steps=args.epochs, model:torch.nn.Module=None, optimizer='adam'):
+    if model is None:
+        raise ValueError('no model provided -.-')
+    
+    loss_fn = torch.nn.MSELoss()
+    
+    if optimizer == 'adam':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
         
-#---------------------#
-class LiveFunctionVizCallback(L.Callback):
-    def __init__(self, parsed_function):
-        super().__init__()
-        self.parsed_function = parsed_function
-        plt.ion()
-        self.fig, self.ax = plt.subplots()
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        model = pl_module.model
-        model.eval()
-
-        with torch.no_grad():
-            device = pl_module.device
-            xs = torch.linspace(-10, 10, 500, device=device).unsqueeze(1)
-            pred = model(xs).squeeze().detach().cpu().numpy()
-
-            true_y = self.parsed_function(xs)
-            if not torch.is_tensor(true_y):
-                true_y = torch.full_like(xs, float(true_y))
-            true_y = true_y.squeeze().cpu().numpy()
-
-            x_np = xs.squeeze().cpu().numpy()
-
-            self.ax.clear()
-            self.ax.axhline(0, linewidth=1)
-            self.ax.axvline(0, linewidth=1)
-            self.ax.plot(x_np, true_y, label="True")
-            self.ax.plot(x_np, pred, label="Prediction")
-            self.ax.legend()
-            self.ax.set_xlabel("x")
-            self.ax.set_ylabel("y")
-            self.ax.set_title(f"Epoch {trainer.current_epoch}")
-            self.ax.grid(True, alpha=0.3)
-            plt.pause(0.01)
+    elif optimizer == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
+        
+    elif optimizer == 'rmsprop':
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=args.learning_rate)
+        
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer}")
+    
+    # lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+    lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=10)
+    
+    for i in range(steps):
+        epoch_loss = 0
+        for X, y in loader:
+            X, y = X.to(device), y.to(device)
             
-class LiveImageVizCallback(L.Callback):
-    def __init__(self, image_size, rgb):
-        super().__init__()
-        self.image_size = image_size
-        self.rgb = rgb
-
-        plt.ion()
-        self.fig, self.ax = plt.subplots()
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        model = pl_module.model
-        model.eval()
-        device = pl_module.device
-
-        with torch.no_grad():
-            axis = torch.linspace(-1, 1, self.image_size, device=device)
-            x_coord, y_coord = torch.meshgrid(axis, axis, indexing='ij')
-            xs = torch.stack([x_coord, y_coord], dim=-1).reshape(-1, 2).float()
-
-            pred = model(xs).detach().cpu()
-
-            self.ax.clear()
-
-            if self.rgb:
-                img = pred.reshape(self.image_size, self.image_size, 3).clamp(0, 1).numpy()
-                self.ax.imshow(img)
-            else:
-                img = pred.reshape(self.image_size, self.image_size).clamp(0, 1).numpy()
-                self.ax.imshow(img, cmap="gray")
-
-            self.ax.set_title(f"Epoch {trainer.current_epoch}")
-            self.ax.axis("off")
-            plt.pause(0.01)
-#---------------------#
+            optimizer.zero_grad()
+            output = model(X)
+            
+            loss = loss_fn(output, y)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=20) #gradient clipping anything above 20
+            
+            epoch_loss += loss.item()
+            optimizer.step()
+            
+        # lr_sched.step()
+        lr_sched.step(epoch_loss / len(loader))
+            
+        yield {'epoch_loss': epoch_loss / len(loader),
+               'learning_rate': optimizer.param_groups[0]['lr']}
+            
+def predict(model, dataset):
+    all_x, all_y = dataset[:]
+    all_x, all_y = all_x.to(device), all_y.to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        return model(all_x)
         
+model_adam = FunctionApproximator(input_size, output_size).to(device)
+model_sgd = FunctionApproximator(input_size, output_size).to(device)
+model_rmsprop = FunctionApproximator(input_size, output_size).to(device)
 
-lit_model = LitModel(model, args.learning_rate)
-callbacks = []
+train_adam = train(steps=args.epochs, model=model_adam, optimizer='adam')
+train_sgd = train(steps=args.epochs, model=model_sgd, optimizer='sgd')
+train_rmsprop = train(steps=args.epochs, model=model_rmsprop, optimizer='rmsprop')
 
-if is_image:
-    callbacks.append(LiveImageVizCallback(args.image_size, args.rgb))
-else:
-    callbacks.append(LiveFunctionVizCallback(parsed_function))
+plt.ion()  # Turn on interactive mode
+fig, axes = plt.subplots(1, 3, figsize=(15, 7))
+titles = ['Adam', 'SGD', 'RMSprop']
 
-trainer = L.Trainer(max_epochs=args.epochs, callbacks=callbacks)
-trainer.fit(lit_model, loader)
+print('training...')
+for i in range(args.epochs):
+    adam_output = next(train_adam)
+    sgd_output = next(train_sgd)
+    rmsprop_output = next(train_rmsprop)
+    
+    outputs = [predict(model_adam, dataset), predict(model_sgd, dataset), predict(model_rmsprop, dataset)]
+    losses = [adam_output['epoch_loss'], sgd_output['epoch_loss'], rmsprop_output['epoch_loss']]
+    learning_rates = [adam_output['learning_rate'], sgd_output['learning_rate'], rmsprop_output['learning_rate']]
+    
+    fig.suptitle(f'Epoch {i+1}/{args.epochs}')
+    
+    for j in range(len(outputs)):
+        axes[j].clear()
+        axes[j].set_title(f"{titles[j]} - Epoch Loss: {losses[j]:.4f}, LR: {learning_rates[j]:.5f}")
+        
+        if is_image:
+            img_shape = (args.image_size, args.image_size, output_size)
+            img_data = outputs[j].cpu().numpy().reshape(img_shape)
+            img_data = np.clip(img_data, 0, 1)
+            axes[j].imshow(img_data)
+        else:
+            all_x, all_y = dataset[:]
+            axes[j].plot(all_x.numpy(), all_y.numpy(), label='Target')
+            axes[j].plot(all_x.numpy(), outputs[j].cpu().numpy(), label='Prediction')
+            axes[j].legend(loc='upper right')
+            
+    plt.pause(0.001)  
+    
+plt.ioff()
+plt.show()
+
+
+"""
+To show the effect of momentum with adam
+try the function: y= x^3 + 2*x^2 + x + 1
+"""
